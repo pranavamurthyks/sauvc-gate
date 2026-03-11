@@ -8,16 +8,14 @@ import numpy as np
 from collections import deque
 
 from custom_msgs.msg import Telemetry, Commands
-from vision_msgs.msg import BoundingBox2D
 from vision_msgs.msg import Detection2DArray
 from std_msgs.msg import Float64MultiArray, Float64
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from custom_msgs.msg import Object2D
 
 
 # Stages
 
-# Stage 1 -> Identify bbox by yaw, allign laterally and surge forward
+# Stage 1 -> Identify bbox, allign laterally and surge forward
 # Stage 2 -> When the gate is out of the frame, come back a bit to check if gate is visible to confirm whether it is loss of vision
 #            of gate because of going near or some other stuff
 # Stage 3 -> Move forward for 4 seconds and take u turn
@@ -37,7 +35,7 @@ class GateControlNode(Node):
 
 
         # Variable Initialization
-        self.stage = 0
+        self.stage = 1
         self.bbox_history = deque(maxlen=5)
         self.pose_history = deque(maxlen=5)
         self.z = None
@@ -51,10 +49,9 @@ class GateControlNode(Node):
 
         self.conf_threshold = 0.5
 
-        # FIX 4 & 5: State variables for non-blocking stage timers
         self.stage_start_time = None
-        self.stage3_phase = 0
-        self.stage3_phase_start_time = None
+
+        self.last_detection_time = None
 
         self.cmd = Commands()
         self.cmd.arm = False
@@ -74,13 +71,11 @@ class GateControlNode(Node):
         self.bbox_sub = self.create_subscription(Detection2DArray, "/vision/detections", self.bbox_callback, self.qos)
         self.frame_center_sub = self.create_subscription(Float64MultiArray, '/frame/center', self.frame_center_callback, self.qos)
 
-
         # Publishers
         self.cmd_pub = self.create_publisher(Commands, '/master/commands', 10)
 
         # Publish stable state
         self.cmd_pub.publish(self.cmd)
-
 
         # Timer
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -106,13 +101,15 @@ class GateControlNode(Node):
                     self.get_logger().debug(f"Skipping detection (confidence {confidence:.2f} < threshold {self.conf_threshold})")
                     continue
             
-            # FIX 7: Safe cast of det.id to int
             try:
                 self.class_id = int(det.id)
             except (ValueError, TypeError):
                 self.class_id = -1
 
             if (self.class_id == 4):
+
+                self.last_detection_time = self.get_clock().now()
+
                 self.bbox_history.append(
                 {
                 'cx': det.bbox.center.position.x,
@@ -130,7 +127,6 @@ class GateControlNode(Node):
 
 
     def frame_center_callback(self, msg):
-        # FIX 1: Access .data field of Float64MultiArray
         self.frame_center_x = msg.data[0]
         self.frame_center_y = msg.data[1]
 
@@ -145,65 +141,129 @@ class GateControlNode(Node):
             self.control_two()
         elif (self.stage == 3):
             self.control_three()
+        elif (self.stage == 4):
+            self.control_four()
 
 
     def control_one(self):
-        # FIX 6: Guard against None values before use
-        if self.bbox_center_x is None or self.frame_center_x is None:
+
+        if self.bbox_center_x is None or self.frame_center_x is None or self.bbox_size_x is None:
+            return
+
+        if self.last_detection_time is None:
+            return
+
+        delta = (self.get_clock().now() - self.last_detection_time).nanoseconds / 1e9
+        if delta > 2.0:
+            self.stage = 2
+            self.cmd.forward = 1500
+            self.cmd.lateral = 1500
+            self.cmd_pub.publish(self.cmd)
             return
 
         self.cmd.arm = True
         self.lateral_error = self.bbox_center_x - self.frame_center_x
-        # FIX 2: Corrected misplaced parenthesis in abs() and replaced self.w with self.bbox_size_x
+
+        error_norm = self.lateral_error / self.frame_center_x
+
         if (abs(self.lateral_error) < 0.05 * self.bbox_size_x):
+            self.cmd.lateral = 1500
             self.cmd.forward = 1550
         else:
-            self.lateral_cmd = 1500 + (self.kp_lateral * self.lateral_error)
+            self.lateral_cmd = 1500 + (self.kp_lateral * error_norm)
             self.cmd.lateral = self.pwm_clamp(self.lateral_cmd)
+
+        self.cmd_pub.publish(self.cmd)
 
     
     def control_two(self):
-        # FIX 4: Non-blocking timer using state machine instead of while True
         if self.stage_start_time is None:
-            self.cmd.forward = 1550
+            self.cmd.forward = 1450
+            self.cmd.lateral = 1500
             self.cmd_pub.publish(self.cmd)
             self.stage_start_time = self.get_clock().now()
 
-        # FIX 3: self.get_clock() called with ()
         delta = (self.get_clock().now() - self.stage_start_time).nanoseconds / 1e9
+
+        # If gate reappears while backing up, return to stage 1
+        if self.last_detection_time is not None:
+            detection_delta = (self.get_clock().now() - self.last_detection_time).nanoseconds / 1e9
+            if detection_delta < 0.5:
+                self.stage = 1
+                self.stage_start_time = None
+                self.cmd.forward = 1500
+                self.cmd.lateral = 1500
+                self.cmd_pub.publish(self.cmd)
+                return
+
         if delta >= 6:
             self.stage = 3
             self.stage_start_time = None
             self.cmd.forward = 1500
+            self.cmd.lateral = 1500
             self.cmd_pub.publish(self.cmd)
         
 
     def control_three(self):
-        # FIX 4 & 5: Non-blocking two-phase timer using stage3_phase and separate start times
-        if self.stage3_phase == 0:
-            if self.stage3_phase_start_time is None:
-                self.cmd.yaw = 1550
-                self.cmd_pub.publish(self.cmd)
-                self.stage3_phase_start_time = self.get_clock().now()
+        if self.stage_start_time is None:
+            self.cmd.yaw = 1550
+            self.cmd_pub.publish(self.cmd)
+            self.stage_start_time = self.get_clock().now()
 
-            # FIX 3: self.get_clock() called with ()
-            delta = (self.get_clock().now() - self.stage3_phase_start_time).nanoseconds / 1e9
-            if delta >= 3:
-                self.cmd.yaw = 1500
-                self.cmd.forward = 1550
-                self.cmd_pub.publish(self.cmd)
-                # FIX 5: Reset start time for the second phase independently
-                self.stage3_phase_start_time = self.get_clock().now()
-                self.stage3_phase = 1
+        delta = (self.get_clock().now() - self.stage_start_time).nanoseconds / 1e9
 
-        elif self.stage3_phase == 1:
-            # FIX 3: self.get_clock() called with ()
-            delta = (self.get_clock().now() - self.stage3_phase_start_time).nanoseconds / 1e9
-            if delta >= 3:
-                self.cmd.forward = 1500
-                self.cmd_pub.publish(self.cmd)
-                self.stage3_phase = 2
+        if delta >= 3:
+            self.cmd.yaw = 1500
+            self.cmd.forward = 1550
+            self.cmd_pub.publish(self.cmd)
+
+        if delta >= 6:
+            self.stage = 4
+            self.stage_start_time = None
+            self.cmd.forward = 1500
+            self.cmd_pub.publish(self.cmd)
+
+
+    def control_four(self):
+        if self.bbox_center_x is None or self.frame_center_x is None or self.bbox_size_x is None:
+            return
+
+        if self.last_detection_time is None:
+            return
+
+        delta = (self.get_clock().now() - self.last_detection_time).nanoseconds / 1e9
+        if delta > 2.0:
+            self.cmd.forward = 1500
+            self.cmd.lateral = 1500
+            self.cmd_pub.publish(self.cmd)
+            return
+
+        self.cmd.arm = True
+        self.lateral_error = self.bbox_center_x - self.frame_center_x
+
+        error_norm = self.lateral_error / self.frame_center_x
+
+        if (abs(self.lateral_error) < 0.05 * self.bbox_size_x):
+            self.cmd.lateral = 1500
+            self.cmd.forward = 1550
+        else:
+            self.lateral_cmd = 1500 + (self.kp_lateral * error_norm)
+            self.cmd.lateral = self.pwm_clamp(self.lateral_cmd)
+
+        self.cmd_pub.publish(self.cmd)
             
 
     def pwm_clamp(self, pwm):
         return min(1700, max(1100, pwm))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GateControlNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
